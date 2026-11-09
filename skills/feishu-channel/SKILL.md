@@ -66,7 +66,7 @@ stdio 支持换行分隔 JSON 与 Content-Length 分帧。
 | `feishu_config_init` | 初始化 lark-cli 应用凭证（app_id + app_secret） |
 | `feishu_set_wake` | 保存全局 webhook（url、key） |
 | `feishu_set_dedicated_assistant` | 登记专属助手 id / name |
-| `feishu_status` | 配置、wake、专属助手、allowlist、inbox、monitor、whoami |
+| `feishu_status` | 配置、wake、专属助手、allowlist、inbox、monitor、whoami。`durability` 分开报告进程 ready、传输连通、端到端唤醒；传输连通不是消息已送达 |
 | `feishu_inbox` | 取出 monitor 缓存的入站消息（取出后清空） |
 | `feishu_send` | bot 发消息：`chat_id` 或 `user_id` + `text`/`markdown` |
 | `feishu_reply` | bot 回复：`message_id` + `text`/`markdown` |

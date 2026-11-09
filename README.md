@@ -74,8 +74,22 @@ Grok Bot 的飞书 / Lark **应用机器人**渠道。配置开放平台 App ID 
 | `account.json` | app_id、专属助手、allowlist（**不含** secret，权限 600） |
 | `wake.json` | webhook url + key（权限 600） |
 | `inbox.jsonl` | 入站缓存 |
-| `monitor.pid` / `monitor.log` | monitor 进程 |
-| `processed.txt` | 已处理 message_id，防重复唤醒 |
+| `monitor.pid` / `monitor.log` / `monitor.lock` | monitor 进程与重启互斥 |
+| `health.json` | 进程 / 传输 / 端到端 三态（不含 secret） |
+| `wake-pending.json` | 已入 inbox、唤醒尚未成功的消息 |
+| `processed.txt` | 唤醒成功后的 message_id，防重复唤醒 |
+
+## 入站耐久
+
+`feishu_status.durability` 把三件事分开：
+
+- `process_ready`：`--monitor` 进程活着，且心跳使用系统开机时间，不靠墙钟。
+- `transport_state=connected`：本进程名下的 lark-cli bus 套接字没有半开迹象。它不证明飞书消息已经进到助手。
+- `e2e_state=proven`：这次 bus 回收之后，至少有一条入站完成了 webhook HTTP 成功。
+
+半开（ESTAB、Send-Q>0、高 RTO/backoff）或 ping timeout 在单调时钟预算内没有恢复时，monitor 会停掉自己拉起的 consume 进程组，并只在命令行确认为 `lark-cli event _bus` 时结束对应 bus，然后重新 consume。不会按进程名清理 MCP host。`--timeout 5m` 只轮换 consumer，不作为健康手段。
+
+唤醒在标记已处理之前写入 `wake-pending.json`。超时或崩溃后下次启动会重试。墙钟前跳期间不按消息年龄丢弃事件。
 
 ## 开发 / 自检
 

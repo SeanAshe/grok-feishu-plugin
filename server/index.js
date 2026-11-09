@@ -2,26 +2,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import {
-  appendInbox,
-  clearPid,
-  drainInbox,
-  hasWake,
-  isAllowed,
-  isConfigured,
-  isProcessed,
-  loadState,
-  loadWake,
-  markProcessed,
-  monitorRunning,
-  paths,
-  peekInboxCount,
-  saveWake,
-  setDedicatedAssistant,
-  statusPayload,
-  updateState,
-  writePid,
-} from "./store.js";
+import { deliverEvent } from "./inbound.js";
 import {
   configInit,
   configShow,
@@ -33,24 +14,61 @@ import {
   whoami,
 } from "./lark.js";
 import {
+  buildDurabilityView,
+  heartbeatAgeMs,
+  identifyProcess,
+  planEnsure,
+  processAgeMs,
+  readCmdline,
+  readProcChildren,
+  readUptimeMs,
+  releaseMonitorLock,
+  signalOwned,
+  tryAcquireMonitorLock,
+} from "./procguard.js";
+import {
+  appendInbox,
+  clearPid,
+  drainInbox,
+  inboxHas,
+  isAllowed,
+  isConfigured,
+  isProcessed,
+  loadState,
+  loadWake,
+  markProcessed,
+  paths,
+  saveWake,
+  setDedicatedAssistant,
+  statusPayload,
+  updateState,
+  writeHealth,
+  readHealth,
+  writePid,
+} from "./store.js";
+import { createSupervisor } from "./supervisor.js";
+import { createBusLogReader, defaultBusLogPath, samplePidSockets } from "./transport.js";
+import {
   connectorAbandoned,
   registerShutdownCleanup,
   runUninstall,
   touchConnectorActive,
   uninstallFeishu,
 } from "./uninstall.js";
+import { createWakeQueue } from "./wake.js";
 
 const self = fileURLToPath(import.meta.url);
-const MAX_EVENT_AGE_MS = 10 * 60 * 1000;
 
-try {
-  fs.mkdirSync("/workspace/.grok-feishu", { recursive: true });
-  fs.appendFileSync(
-    "/workspace/.grok-feishu/mcp-host.log",
-    `${new Date().toISOString()} spawn pid=${process.pid} argv=${JSON.stringify(process.argv)} cwd=${process.cwd()}\n`,
-  );
-} catch {
-  /* ignore */
+function noteHostSpawn() {
+  try {
+    fs.mkdirSync("/workspace/.grok-feishu", { recursive: true });
+    fs.appendFileSync(
+      "/workspace/.grok-feishu/mcp-host.log",
+      `${new Date().toISOString()} spawn pid=${process.pid} argv=${JSON.stringify(process.argv)} cwd=${process.cwd()}\n`,
+    );
+  } catch {
+    /* ignore */
+  }
 }
 try {
   if (process.stdout._handle?.setBlocking) process.stdout._handle.setBlocking(true);
@@ -70,10 +88,95 @@ function fail(message) {
   };
 }
 
+function killOwned(requests) {
+  return signalOwned(requests, {
+    readCmdline,
+    selfPid: process.pid,
+    kill: (pid, sig) => process.kill(pid, sig),
+  });
+}
+
+function monitorSnapshot(pid) {
+  const alive = pid ? isPidAliveSafe(pid) : false;
+  const role = alive ? identifyProcess(pid, readCmdline(pid)) : "dead_or_unreadable";
+  let uptime = 0;
+  try {
+    uptime = readUptimeMs();
+  } catch {
+    uptime = 0;
+  }
+  const health = readHealth();
+  const age = heartbeatAgeMs(health, uptime, pid);
+  return {
+    pid,
+    alive,
+    role,
+    uptime,
+    health,
+    age,
+    procAge: alive ? processAgeMs(pid, uptime) : null,
+    durability: buildDurabilityView({ role, alive, heartbeatAgeMs: age, health }),
+  };
+}
+
+function isPidAliveSafe(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waitUptime(timeoutMs, pred) {
+  let start = 0;
+  try {
+    start = readUptimeMs();
+  } catch {
+    return pred();
+  }
+  while (readUptimeMs() - start < timeoutMs) {
+    if (pred()) return true;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+  return pred();
+}
+
 function ensureMonitor() {
-  const existing = monitorRunning();
-  if (existing) return { already_running: true, pid: existing };
   if (!isConfigured()) return { started: false, reason: "not_configured" };
+  const rawPid = Number(fs.existsSync(paths().pid) ? fs.readFileSync(paths().pid, "utf8").trim() : 0) || 0;
+  const snap = monitorSnapshot(rawPid);
+  const plan = planEnsure({
+    pid: rawPid,
+    role: snap.role,
+    alive: snap.alive,
+    heartbeatAgeMs: snap.age,
+    processAgeMs: snap.procAge,
+  });
+  if (plan.clearStalePid) clearPid();
+  if (plan.kill.length) {
+    const signaled = killOwned(plan.kill);
+    const gone = waitUptime(5000, () => !isPidAliveSafe(rawPid));
+    if (!gone) killOwned(plan.kill.map((item) => ({ ...item, sig: "SIGKILL" })));
+    return {
+      ...spawnMonitor(),
+      replaced: plan.reason,
+      signaled,
+    };
+  }
+  if (plan.action === "keep") {
+    return {
+      already_running: true,
+      pid: rawPid,
+      reason: plan.reason,
+      durability: snap.durability,
+    };
+  }
+  return spawnMonitor();
+}
+
+function spawnMonitor() {
   const child = spawn(process.execPath, [self, "--monitor"], {
     detached: true,
     stdio: "ignore",
@@ -81,7 +184,13 @@ function ensureMonitor() {
   });
   child.unref();
   writePid(child.pid);
-  return { started: true, pid: child.pid };
+  return {
+    started: true,
+    pid: child.pid,
+    process_ready: false,
+    transport_state: "unknown",
+    e2e_state: "unproven",
+  };
 }
 
 const tools = {
@@ -109,7 +218,10 @@ const tools = {
     inputSchema: { type: "object", properties: {} },
     handle: async () => {
       const payload = statusPayload();
-      payload.monitor_pid = monitorRunning();
+      const rawPid = Number(fs.existsSync(paths().pid) ? fs.readFileSync(paths().pid, "utf8").trim() : 0) || 0;
+      const snap = monitorSnapshot(rawPid);
+      payload.monitor_pid = snap.role === "monitor" && snap.alive ? rawPid : 0;
+      payload.durability = snap.durability;
       try {
         payload.lark_cli_path = larkCliPath();
         payload.whoami = whoami();
@@ -215,7 +327,7 @@ const tools = {
   },
   feishu_start_monitor: {
     description:
-      "后台启动长连接：lark-cli event consume im.message.receive_v1 --as bot。收到事件写入 inbox 并 POST wake webhook。已在跑则直接返回。",
+      "后台启动长连接：lark-cli event consume im.message.receive_v1 --as bot。收到事件先入 inbox 再唤醒 webhook。心跳新鲜则不重启；不杀 MCP host。半开传输由 monitor 回收整条 bus。",
     inputSchema: { type: "object", properties: {} },
     handle: async () => ok(ensureMonitor()),
   },
@@ -223,15 +335,14 @@ const tools = {
     description: "停止后台长连接 monitor。",
     inputSchema: { type: "object", properties: {} },
     handle: async () => {
-      const pid = monitorRunning();
-      if (!pid) return ok({ stopped: true, was_running: false });
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch {
-        /* ignore */
+      const rawPid = Number(fs.existsSync(paths().pid) ? fs.readFileSync(paths().pid, "utf8").trim() : 0) || 0;
+      const snap = monitorSnapshot(rawPid);
+      if (snap.role !== "monitor" || !snap.alive) {
+        if (rawPid) clearPid();
+        return ok({ stopped: true, was_running: false, refused: snap.role, killed: false });
       }
-      clearPid();
-      return ok({ stopped: true, pid });
+      const signaled = killOwned([{ pid: rawPid, role: "monitor", sig: "SIGTERM" }]);
+      return ok({ stopped: true, pid: rawPid, signaled });
     },
   },
   feishu_approve: {
@@ -387,82 +498,37 @@ function startMcp() {
   });
 }
 
-async function wakeAgent(messages, log) {
-  if (!messages.length) return;
+function postWake(message, { signal }) {
   const cfg = loadWake();
-  if (!cfg) {
-    log("wake skipped: no wake config");
-    return;
+  if (!cfg?.url || !cfg?.key) {
+    const error = new Error("no_wake_config");
+    error.code = "NO_WAKE";
+    throw error;
   }
   const state = loadState();
-  // Feishu-style: POST full event payload (first message) plus batch meta.
-  // Also compatible with install skill that then calls feishu_inbox.
   const body = {
     source: "grok-feishu",
-    count: messages.length,
+    count: 1,
     app_id: state.appId || "",
     dedicated_assistant_id: state.dedicatedAssistant?.id || "",
     dedicated_assistant_name: state.dedicatedAssistant?.name || "",
-    message_ids: messages.map((m) => m.message_id),
-    sender_ids: messages.map((m) => m.sender_id),
-    // Direct payload for the newest event (bridge-compatible)
-    ...messages[0],
-    events: messages,
+    message_ids: [message.message_id],
+    sender_ids: [message.sender_id],
+    ...message,
+    events: [message],
   };
-  try {
-    const res = await fetch(cfg.url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${cfg.key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
+  return fetch(cfg.url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  }).then(async (res) => {
     const text = await res.text();
-    log(`wake ${res.status} ${text.slice(0, 180)}`);
-  } catch (err) {
-    log(`wake error ${err instanceof Error ? err.message : String(err)}`);
-  }
-}
-
-function eventTooOld(ev) {
-  const ct = Number(ev.create_time || ev.timestamp || 0);
-  if (!ct) return false;
-  // Feishu create_time is often ms since epoch
-  const ms = ct > 1e12 ? ct : ct * 1000;
-  return Date.now() - ms > MAX_EVENT_AGE_MS;
-}
-
-async function handleEventLine(line, log) {
-  let raw;
-  try {
-    raw = JSON.parse(line);
-  } catch {
-    log(`skip non-json: ${line.slice(0, 80)}`);
-    return;
-  }
-  const msg = normalizeEvent(raw);
-  if (!msg?.message_id) {
-    log("skip event without message_id");
-    return;
-  }
-  if (isProcessed(msg.message_id)) {
-    log(`skip-processed ${msg.message_id}`);
-    return;
-  }
-  if (eventTooOld(raw)) {
-    log(`skip-old ${msg.message_id}`);
-    return;
-  }
-  const state = loadState();
-  if (!isAllowed(state, msg.sender_id)) {
-    log(`skip-allowlist ${msg.sender_id}`);
-    return;
-  }
-  appendInbox([msg]);
-  markProcessed(msg.message_id);
-  log(`inbox +1 ${msg.message_id} from=${msg.sender_id}`);
-  await wakeAgent([msg], log);
+    return { ok: res.ok, status: res.status, body: text.slice(0, 180) };
+  });
 }
 
 async function runMonitor() {
@@ -471,71 +537,149 @@ async function runMonitor() {
     logStream.write(`${new Date().toISOString()} ${line}\n`);
   };
   log("monitor start");
+  loadState();
+  const lock = tryAcquireMonitorLock(paths().lock, {
+    pid: process.pid,
+    readCmdline,
+    isAlive: isPidAliveSafe,
+    heartbeatFresh: (holderPid) => {
+      let uptime = 0;
+      try {
+        uptime = readUptimeMs();
+      } catch {
+        return false;
+      }
+      const age = heartbeatAgeMs(readHealth(), uptime, holderPid);
+      if (age != null && age <= 25_000) return true;
+      const procAge = processAgeMs(holderPid, uptime);
+      return procAge != null && procAge <= 30_000;
+    },
+  });
+  if (!lock.acquired) {
+    log(`monitor lock not acquired: ${lock.reason} holder=${lock.holderPid || 0}`);
+    process.exit(0);
+  }
   writePid(process.pid);
 
-  let child = null;
-  let stopping = false;
-  let restartDelay = 2000;
+  const queue = createWakeQueue({
+    pendingPath: paths().wakePending,
+    readProcessed: isProcessed,
+    markProcessed,
+    appendInbox,
+    inboxHas,
+    fetchImpl: postWake,
+    log,
+    timeoutMs: Number(process.env.FEISHU_WAKE_TIMEOUT_MS || 10_000),
+  });
+  let busLogPath = "";
+  try {
+    busLogPath = defaultBusLogPath(loadState().appId || "");
+  } catch {
+    busLogPath = "";
+  }
+  const readNewBusEvents = createBusLogReader(busLogPath);
+  let supervisor;
+  supervisor = createSupervisor({
+    log,
+    selfPid: process.pid,
+    spawnConsume: (handlers) => spawnEventConsume({ ...handlers, log }),
+    sampleSockets: (pid) => samplePidSockets(pid),
+    readNewBusEvents,
+    readCmdline,
+    readChildren: readProcChildren,
+    isAlive: isPidAliveSafe,
+    signalOwned: killOwned,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    nowMono: () => performance.now(),
+    nowWall: () => Date.now(),
+    readUptimeMs,
+    writeHealth,
+    writePid,
+    clearPid,
+    releaseLock: () => releaseMonitorLock(paths().lock, process.pid),
+    pendingCount: () => queue.pendingCount(),
+    flushWakes: () => queue.flush(),
+    onEventLine: (line) =>
+      deliverEvent({
+        line,
+        normalize: normalizeEvent,
+        isAllowed,
+        state: loadState(),
+        clockSuspect: supervisor.isClockSuspect(),
+        queue,
+        log,
+      }),
+    intervalMs: Number(process.env.FEISHU_PROBE_INTERVAL_MS || 10_000),
+    probeTimeoutMs: Number(process.env.FEISHU_PROBE_TIMEOUT_MS || 8_000),
+    graceMs: Number(process.env.FEISHU_STOP_GRACE_MS || 3_000),
+  });
 
+  let stopping = false;
   const onExit = () => {
+    if (stopping) return;
     stopping = true;
-    try {
-      if (child && !child.killed) child.kill("SIGTERM");
-    } catch {
-      /* ignore */
-    }
-    clearPid();
-    process.exit(0);
+    supervisor.stop().finally(() => process.exit(0));
   };
   process.on("SIGTERM", onExit);
   process.on("SIGINT", onExit);
 
-  const loop = () => {
+  const maintenance = setInterval(() => {
     if (stopping) return;
     if (connectorAbandoned()) {
       log("connector removed, running uninstall");
-      runUninstall();
-      process.exit(0);
+      stopping = true;
+      supervisor.stop().finally(() => {
+        runUninstall();
+        process.exit(0);
+      });
+      return;
     }
     if (!isConfigured()) {
       log("not configured, stopping");
-      clearPid();
-      process.exit(0);
+      stopping = true;
+      supervisor.stop().finally(() => process.exit(0));
     }
+  }, 5_000);
+  if (typeof maintenance.unref === "function") maintenance.unref();
 
-    child = spawnEventConsume({
-      log,
-      onLine: (line) => {
-        handleEventLine(line, log).catch((err) => {
-          log(`handle error ${err instanceof Error ? err.message : String(err)}`);
-        });
-      },
-      onExit: (code, signal) => {
-        log(`lark-cli exited code=${code} signal=${signal}`);
-        if (stopping) return;
-        setTimeout(() => {
-          restartDelay = Math.min(restartDelay * 1.5, 30_000);
-          loop();
-        }, restartDelay);
-      },
-    });
-    // Reset backoff after a successful spawn
-    restartDelay = 2000;
-  };
-
-  loop();
+  const started = await supervisor.start();
+  if (!started.started) {
+    log(`monitor exit: ${started.reason || "not started"}`);
+    process.exit(0);
+  }
+  const intervalMs = Number(process.env.FEISHU_PROBE_INTERVAL_MS || 10_000);
+  while (!stopping) {
+    try {
+      await supervisor.tick();
+    } catch (error) {
+      log(`tick error ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (stopping) break;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
-if (process.argv.includes("--monitor")) {
-  runMonitor();
-} else if (process.argv.includes("--ensure-monitor")) {
-  process.stdout.write(`${JSON.stringify(ensureMonitor())}\n`);
-} else if (process.argv.includes("--list-tools")) {
-  process.stdout.write(`${JSON.stringify(TOOL_LIST, null, 2)}\n`);
-} else if (process.argv.includes("--uninstall")) {
-  process.stdout.write(
-    `${JSON.stringify(runUninstall({ deferPluginRemoval: false }), null, 2)}\n`,
-  );
-} else {
-  startMcp();
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
+  if (process.argv.includes("--monitor")) {
+    runMonitor();
+  } else if (process.argv.includes("--ensure-monitor")) {
+    process.stdout.write(`${JSON.stringify(ensureMonitor())}\n`);
+  } else if (process.argv.includes("--list-tools")) {
+    process.stdout.write(`${JSON.stringify(TOOL_LIST, null, 2)}\n`);
+  } else if (process.argv.includes("--uninstall")) {
+    process.stdout.write(`${JSON.stringify(runUninstall({ deferPluginRemoval: false }), null, 2)}\n`);
+  } else {
+    noteHostSpawn();
+    startMcp();
+  }
 }

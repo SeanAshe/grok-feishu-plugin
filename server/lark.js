@@ -225,23 +225,35 @@ export function replyMessage({ messageId, text, markdown, replyInThread = false 
 }
 
 /**
- * Spawn long-lived `lark-cli event consume` and stream NDJSON lines to onEvent.
- * Returns { child, kill }.
+ * Direct `lark-cli event consume` argv.
+ * Do not pass `--timeout`: a timed consumer exit only rotates the consumer onto
+ * the same bus and does not heal a half-open websocket. The monitor holds stdin
+ * open itself and recycles the bus when transport probes say so.
+ */
+export function eventConsumeArgs() {
+  return ["event", "consume", EVENT_KEY, "--as", "bot"];
+}
+
+/**
+ * Spawn long-lived `lark-cli event consume` and stream NDJSON lines.
+ * Stdin stays open until closeStdin() so lark-cli does not exit on EOF.
+ * The child is a new process-group leader so stop/recycle can signal that
+ * group without touching the MCP host.
  */
 export function spawnEventConsume({ onLine, onExit, log } = {}) {
   const bin = resolveLarkCli();
-  // lark-cli exits when stdin closes; keep stdin open via bash + tail -f /dev/null
-  const shellCmd = `"${bin}" event consume ${EVENT_KEY} --as bot < <(tail -f /dev/null)`;
-  log?.(`spawn bash -lc ${shellCmd}`);
+  const args = eventConsumeArgs();
+  log?.(`spawn ${bin} ${args.join(" ")} (stdin held open, no consume timeout)`);
 
-  const child = spawn("bash", ["-lc", shellCmd], {
-    stdio: ["ignore", "pipe", "pipe"],
+  const child = spawn(bin, args, {
+    stdio: ["pipe", "pipe", "pipe"],
     env: {
       ...process.env,
       PATH: `${path.dirname(bin)}:${process.env.PATH || ""}`,
     },
-    detached: false,
+    detached: true,
   });
+  child.stdin?.on("error", () => {});
 
   let buf = "";
   child.stdout.setEncoding("utf8");
@@ -268,7 +280,17 @@ export function spawnEventConsume({ onLine, onExit, log } = {}) {
     onExit?.(code, signal);
   });
 
-  return child;
+  return {
+    child,
+    pid: child.pid,
+    closeStdin() {
+      try {
+        child.stdin?.end();
+      } catch {
+        // stdin already closed
+      }
+    },
+  };
 }
 
 export { EVENT_KEY };

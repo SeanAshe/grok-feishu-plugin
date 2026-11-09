@@ -8,6 +8,7 @@
     "start": "node server/index.js",
     "monitor": "node server/index.js --monitor",
     "uninstall": "node server/uninstall.js --uninstall",
-    "check": "node --check server/index.js && node --check server/store.js && node --check server/lark.js && node --check server/uninstall.js"
+    "check": "node --check server/index.js && node --check server/store.js && node --check server/lark.js && node --check server/uninstall.js && node --check server/transport.js && node --check server/procguard.js && node --check server/wake.js && node --check server/inbound.js && node --check server/supervisor.js",
+    "test": "node --test server/*.test.js"
   }
 }

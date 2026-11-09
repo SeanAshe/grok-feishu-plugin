@@ -18,6 +18,9 @@ export function paths() {
     pid: path.join(home, "monitor.pid"),
     log: path.join(home, "monitor.log"),
     processed: path.join(home, "processed.txt"),
+    health: path.join(home, "health.json"),
+    wakePending: path.join(home, "wake-pending.json"),
+    lock: path.join(home, "monitor.lock"),
   };
 }
 
@@ -120,6 +123,41 @@ export function drainInbox() {
       }
     })
     .filter(Boolean);
+}
+
+export function inboxHas(messageId) {
+  if (!messageId) return false;
+  const { inbox } = paths();
+  if (!fs.existsSync(inbox)) return false;
+  return fs
+    .readFileSync(inbox, "utf8")
+    .split("\n")
+    .some((line) => {
+      if (!line.trim()) return false;
+      try {
+        return JSON.parse(line).message_id === messageId;
+      } catch {
+        return false;
+      }
+    });
+}
+
+export function readHealth() {
+  const { health } = paths();
+  if (!fs.existsSync(health)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(health, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export function writeHealth(health) {
+  ensureHome();
+  const file = paths().health;
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(health, null, 2));
+  fs.renameSync(tmp, file);
 }
 
 export function peekInboxCount() {
