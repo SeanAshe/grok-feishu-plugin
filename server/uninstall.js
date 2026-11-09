@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { identifyProcess, readCmdline, selectStopTargets } from "./procguard.js";
 import { clearPid, homeDir, loadState, monitorRunning, readPid } from "./store.js";
 
 const PLUGIN_DIR_NAMES = ["grok-feishu-plugin"];
@@ -76,6 +77,8 @@ function listMonitorPids() {
 export function stopAllMonitors() {
   const stopped = [];
   for (const pid of listMonitorPids()) {
+    const role = identifyProcess(pid, readCmdline(pid));
+    if (!selectStopTargets([{ pid, role }]).length) continue;
     try {
       process.kill(pid, "SIGTERM");
       stopped.push(pid);
@@ -181,15 +184,31 @@ function mcpStillRunning() {
   return false;
 }
 
-let mcpGoneSince = 0;
+let mcpGoneSinceUptime = 0;
 
-export function connectorAbandoned() {
-  if (mcpStillRunning()) {
-    mcpGoneSince = 0;
-    return false;
+export function evaluateConnectorPresence(prevGoneSince, { mcpRunning, nowUptimeMs, thresholdMs = 30_000 } = {}) {
+  if (mcpRunning) return { abandoned: false, goneSinceUptime: 0 };
+  const since = prevGoneSince || nowUptimeMs;
+  return {
+    abandoned: nowUptimeMs - since > thresholdMs,
+    goneSinceUptime: since,
+  };
+}
+
+export function connectorAbandoned(readUptime = () => {
+  try {
+    const raw = fs.readFileSync("/proc/uptime", "utf8");
+    return Math.floor(Number(raw.trim().split(/\s+/)[0]) * 1000);
+  } catch {
+    return 0;
   }
-  if (!mcpGoneSince) mcpGoneSince = Date.now();
-  return Date.now() - mcpGoneSince > 30_000;
+}) {
+  const decision = evaluateConnectorPresence(mcpGoneSinceUptime, {
+    mcpRunning: mcpStillRunning(),
+    nowUptimeMs: readUptime(),
+  });
+  mcpGoneSinceUptime = decision.goneSinceUptime;
+  return decision.abandoned;
 }
 
 export function touchConnectorActive() {
