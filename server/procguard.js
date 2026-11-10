@@ -49,10 +49,11 @@ export function processAgeMs(pid, nowUptimeMs, reader = fs.readFileSync) {
   }
 }
 
-export function heartbeatAgeMs(health, nowUptimeMs, pid) {
+export function heartbeatAgeMs(health, nowBootMs, pid) {
   if (!health || health.pid !== pid) return null;
-  if (typeof health.uptime_ms !== "number" || typeof nowUptimeMs !== "number") return null;
-  return Math.max(0, nowUptimeMs - health.uptime_ms);
+  const mark = typeof health.boot_uptime_ms === "number" ? health.boot_uptime_ms : health.uptime_ms;
+  if (typeof mark !== "number" || typeof nowBootMs !== "number") return null;
+  return Math.max(0, nowBootMs - mark);
 }
 
 export function planEnsure({ pid, role, alive, heartbeatAgeMs: age, processAgeMs: procAge } = {}) {
@@ -219,6 +220,9 @@ export function buildDurabilityView({ role, alive, heartbeatAgeMs: age, health }
   const processReady = role === "monitor" && alive && age != null && age <= HEARTBEAT_STALE_MS;
   let transport = health?.transport?.state || "unknown";
   let e2e = health?.e2e?.state || "unproven";
+  if (e2e === "proven") e2e = "wake_accepted";
+  if (e2e === "failing") e2e = "wake_failing";
+  if (e2e === "pending") e2e = "wake_pending";
   if (!processReady) {
     transport = alive ? "unknown" : "down";
     e2e = "unproven";
@@ -235,8 +239,11 @@ export function buildDurabilityView({ role, alive, heartbeatAgeMs: age, health }
     transport_state: transport,
     transport_reason: processReady ? health?.transport?.reason || "" : "process_not_ready",
     e2e_state: e2e,
+    reply_e2e: "unproven",
     e2e_note:
-      "进程 ready 与 TCP ESTAB / transport_connected 都不是端到端证明；e2e proven 只表示本次 bus 回收之后至少有一次入站唤醒 HTTP 成功",
+      "wake_accepted 只表示 webhook HTTP 成功，不是飞书回复已经送达。process_ready、TCP ESTAB、transport_connected 也都不是完整回复。",
+    boot_uptime_ms: health?.boot_uptime_ms ?? null,
+    monitor_age_ms: health?.monitor_age_ms ?? null,
     rotation_is_health: false,
     pending_wakes: health?.pending_wakes ?? 0,
     clock_suspect: Boolean(health?.clock_suspect),

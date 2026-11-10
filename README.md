@@ -83,11 +83,11 @@ Grok Bot 的飞书 / Lark **应用机器人**渠道。配置开放平台 App ID 
 
 `feishu_status.durability` 把三件事分开：
 
-- `process_ready`：`--monitor` 进程活着，且心跳使用系统开机时间，不靠墙钟。
-- `transport_state=connected`：本进程名下的 lark-cli bus 套接字没有半开迹象。它不证明飞书消息已经进到助手。
-- `e2e_state=proven`：这次 bus 回收之后，至少有一条入站完成了 webhook HTTP 成功。
+- `process_ready`：`--monitor` 进程活着。心跳比较的是 `boot_uptime_ms`（机器自开机起的单调时间）。`monitor_age_ms` 才是这个 monitor 进程的年龄。
+- `transport_state=connected`：当前这一代 bus 自己的 ESTAB 套接字没有持续的 Send-Q 停滞。它不证明飞书消息已经进到助手。
+- `e2e_state=wake_accepted`：这次 bus 回收之后，至少有一次 webhook HTTP 成功。`reply_e2e` 仍是 `unproven`，要在 box 上看到助手实际回复才算完整回复。
 
-半开（ESTAB、Send-Q>0、高 RTO/backoff）或 ping timeout 在单调时钟预算内没有恢复时，monitor 会停掉自己拉起的 consume 进程组，并只在命令行确认为 `lark-cli event _bus` 时结束对应 bus，然后重新 consume。不会按进程名清理 MCP host。`--timeout 5m` 只轮换 consumer，不作为健康手段。
+半开回收只看当前 bus pid 的 ESTAB 套接字，并且要有两份至少相隔 15 秒的单调时钟样本、Send-Q 持续大于 0、bytes_acked 没有前进。刚连通的 15 秒内不回收。一次回收后至少冷却 30 秒。不会因为没有 pid 的 FIN-WAIT、别的进程连到同一个 fake-IP、或单独一次高 RTO 就回收。真正持续半开仍会在这个预算内回收。不会按进程名清理 MCP host。
 
 唤醒在标记已处理之前写入 `wake-pending.json`。超时或崩溃后下次启动会重试。墙钟前跳期间不按消息年龄丢弃事件。
 

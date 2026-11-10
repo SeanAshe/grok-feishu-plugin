@@ -17,6 +17,11 @@ export const LIMITS = {
   severeBackoff: 6,
   severeRtoMs: 8000,
   mildPersistMs: 15_000,
+  connectGraceMs: 15_000,
+  recycleCooldownMs: 30_000,
+  recycleBudgetWindowMs: 10 * 60 * 1000,
+  recycleBudgetCount: 3,
+  recycleBudgetCooldownMs: 90_000,
   pingRecoveryMs: 45_000,
   clockJumpForwardMs: 30_000,
   clockJumpBackwardMs: 2_000,
@@ -85,6 +90,48 @@ function isHttpsPeer(peer) {
   return value.endsWith(":443") || value.endsWith(":https");
 }
 
+export function socketPublic(sock) {
+  if (!sock) return {};
+  const local = String(sock.local || "");
+  const peer = String(sock.peer || "");
+  return {
+    state: sock.state || "",
+    send_q: Number(sock.sendQ || 0),
+    recv_q: Number(sock.recvQ || 0),
+    local_port: local.includes(":") ? local.slice(local.lastIndexOf(":") + 1) : "",
+    peer_port: peer.includes(":") ? peer.slice(peer.lastIndexOf(":") + 1) : "",
+    rto_ms: sock.rto ?? null,
+    backoff: sock.backoff ?? null,
+    bytes_sent: sock.bytesSent ?? null,
+    bytes_retrans: sock.bytesRetrans ?? null,
+    bytes_acked: sock.bytesAcked ?? null,
+    pid: sock.pid ?? null,
+  };
+}
+
+export function formatSocketEvidence(sock) {
+  const pub = socketPublic(sock);
+  return [
+    `state=${pub.state || "-"}`,
+    `pid=${pub.pid ?? "-"}`,
+    `send_q=${pub.send_q}`,
+    `recv_q=${pub.recv_q}`,
+    `local_port=${pub.local_port || "-"}`,
+    `peer_port=${pub.peer_port || "-"}`,
+    `rto_ms=${pub.rto_ms ?? "-"}`,
+    `backoff=${pub.backoff ?? "-"}`,
+    `bytes_sent=${pub.bytes_sent ?? "-"}`,
+    `bytes_retrans=${pub.bytes_retrans ?? "-"}`,
+    `bytes_acked=${pub.bytes_acked ?? "-"}`,
+  ].join(" ");
+}
+
+/**
+ * Label one socket. This does not by itself authorize a recycle.
+ * FIN-WAIT / pid-less / high-RTO-with-empty-Send-Q are not half_open_severe:
+ * those shapes showed up as leftovers on the shared fake-IP and were recycled
+ * as if they were the live bus.
+ */
 export function classifySocket(sock) {
   if (!sock) return "other";
   const sendQ = Number(sock.sendQ || 0);
@@ -92,81 +139,179 @@ export function classifySocket(sock) {
   const rto = Number(sock.rto || 0);
   const retrans = Number(sock.bytesRetrans || 0);
   const state = sock.state || "";
-  const halfClose = state.startsWith("FIN-WAIT") || state === "CLOSE-WAIT" || state === "LAST-ACK";
-  if (halfClose && (sendQ > 0 || backoff >= LIMITS.severeBackoff || rto >= LIMITS.severeRtoMs)) {
-    return "half_open_severe";
-  }
   if (state !== "ESTAB" || !isHttpsPeer(sock.peer)) return "other";
-  if (sendQ > 0 && backoff >= LIMITS.severeBackoff && rto >= LIMITS.severeRtoMs) {
-    return "half_open_severe";
+  if (sendQ > 0 && backoff >= LIMITS.severeBackoff && rto >= LIMITS.severeRtoMs && retrans > 0) {
+    return "half_open_candidate";
   }
-  if (sendQ > 0 && (retrans > 0 || backoff >= 1 || rto >= 1000)) return "half_open_mild";
+  if (sendQ > 0 && (retrans > 0 || backoff >= 1)) return "half_open_mild";
   if (sendQ === 0) return "idle_or_healthy";
   return "other";
+}
+
+export function selectCurrentSockets(sockets, busPid) {
+  const kept = [];
+  const ignored = [];
+  for (const sock of sockets || []) {
+    if (!busPid || sock?.pid !== busPid) {
+      ignored.push({ reason: sock?.pid ? "other_pid" : "missing_pid", ...socketPublic(sock) });
+      continue;
+    }
+    if (sock.state !== "ESTAB" || !isHttpsPeer(sock.peer)) {
+      ignored.push({ reason: "not_current_estab", ...socketPublic(sock) });
+      continue;
+    }
+    kept.push(sock);
+  }
+  return { kept, ignored };
 }
 
 function socketKey(sock) {
   return `${sock.local || ""}>${sock.peer || ""}`;
 }
 
-function persistentMild(samples) {
+function ownedSamples(samples, busPid, generation) {
+  return (samples || []).filter((sample) => {
+    if (busPid && sample.busPid && sample.busPid !== busPid) return false;
+    if (generation != null && sample.generation != null && sample.generation !== generation) return false;
+    return true;
+  });
+}
+
+function currentSockets(sample, busPid) {
+  return selectCurrentSockets(sample?.sockets || [], busPid).kept;
+}
+
+function findSustainedStall(samples, busPid) {
   const latest = samples[samples.length - 1];
-  if (!latest?.sockets?.length) return false;
-  for (const sock of latest.sockets) {
-    if (classifySocket(sock) !== "half_open_mild" && classifySocket(sock) !== "half_open_severe") continue;
+  if (!latest) return null;
+  for (const sock of currentSockets(latest, busPid)) {
+    const kind = classifySocket(sock);
+    if (kind !== "half_open_candidate" && kind !== "half_open_mild") continue;
+    if (sock.bytesAcked == null) continue;
     const earlier = [...samples].reverse().find((sample) => {
       if (sample === latest) return false;
       if (latest.monoMs - sample.monoMs < LIMITS.mildPersistMs) return false;
-      return (sample.sockets || []).some((prev) => {
+      return currentSockets(sample, busPid).some((prev) => {
         if (socketKey(prev) !== socketKey(sock)) return false;
-        const kind = classifySocket(prev);
-        if (kind !== "half_open_mild" && kind !== "half_open_severe") return false;
-        if (Number(prev.sendQ || 0) <= 0 || Number(sock.sendQ || 0) <= 0) return false;
-        if (prev.bytesAcked == null || sock.bytesAcked == null) return true;
-        return prev.bytesAcked === sock.bytesAcked;
+        if (prev.pid !== sock.pid) return false;
+        const prevKind = classifySocket(prev);
+        if (prevKind !== "half_open_candidate" && prevKind !== "half_open_mild") return false;
+        if (prev.bytesAcked == null || prev.bytesAcked !== sock.bytesAcked) return false;
+        return Number(prev.sendQ || 0) > 0 && Number(sock.sendQ || 0) > 0;
       });
     });
-    if (earlier) return true;
+    if (!earlier) continue;
+    return {
+      sock,
+      earlierMono: earlier.monoMs,
+      spanMs: latest.monoMs - earlier.monoMs,
+      severe: kind === "half_open_candidate",
+    };
   }
-  return false;
+  return null;
 }
 
-function unrecoveredPing(busEvents, samples, nowMono) {
+function cooldownMs(nowMono, recentRecycleMonos) {
+  const recent = (recentRecycleMonos || []).filter((stamp) => nowMono - stamp < LIMITS.recycleBudgetWindowMs);
+  if (recent.length >= LIMITS.recycleBudgetCount) return LIMITS.recycleBudgetCooldownMs;
+  if (recent.length > 0) return LIMITS.recycleCooldownMs;
+  return 0;
+}
+
+function unrecoveredPing(busEvents, samples, nowMono, busPid, generation, busStartedMono) {
+  const events = (busEvents || []).filter((event) => {
+    if (generation != null && event.generation != null && event.generation !== generation) return false;
+    if (busStartedMono != null && event.monoMs < busStartedMono) return false;
+    return true;
+  });
   let lastPing = null;
-  for (const event of busEvents) {
+  for (const event of events) {
     if (event.kind === "ping_timeout") lastPing = event;
   }
   if (!lastPing || typeof lastPing.monoMs !== "number") return false;
   if (nowMono - lastPing.monoMs < LIMITS.pingRecoveryMs) return false;
-  for (const event of busEvents) {
-    if (event.monoMs > lastPing.monoMs && event.kind === "bus_started") return false;
+  for (const event of events) {
+    if (event.monoMs > lastPing.monoMs && event.kind === "bus_started" && (!busPid || event.pid === busPid)) {
+      return false;
+    }
   }
-  for (const sample of samples) {
+  const owned = ownedSamples(samples, busPid, generation);
+  for (const sample of owned) {
     if (sample.monoMs <= lastPing.monoMs) continue;
-    const kinds = (sample.sockets || []).map(classifySocket);
-    if (kinds.includes("idle_or_healthy") && !kinds.includes("half_open_severe") && !kinds.includes("half_open_mild")) {
+    const kinds = currentSockets(sample, busPid).map(classifySocket);
+    if (kinds.includes("idle_or_healthy") && !kinds.includes("half_open_candidate") && !kinds.includes("half_open_mild")) {
       return false;
     }
   }
   return true;
 }
 
-export function decideRecovery({ samples = [], busEvents = [], nowMono = 0 } = {}) {
-  const latest = samples[samples.length - 1];
-  if (latest?.sockets?.some((sock) => classifySocket(sock) === "half_open_severe")) {
-    return { action: "recycle_full", reason: "half_open_severe", rotation_is_health: false };
+export function decideRecovery({
+  samples = [],
+  busEvents = [],
+  nowMono = 0,
+  busPid = 0,
+  generation = null,
+  connectedMono = null,
+  busStartedMono = null,
+  recentRecycleMonos = [],
+} = {}) {
+  const base = { rotation_is_health: false, evidence: "" };
+  if (!busPid) return { action: "none", reason: "bus_unattributed", ...base };
+  const lastRecycle = recentRecycleMonos.length ? recentRecycleMonos[recentRecycleMonos.length - 1] : null;
+  const cool = cooldownMs(nowMono, recentRecycleMonos);
+  if (lastRecycle != null && nowMono - lastRecycle < cool) {
+    return { action: "none", reason: "recycle_cooldown", ...base, cooldown_ms: cool };
   }
-  if (persistentMild(samples)) {
-    return { action: "recycle_full", reason: "half_open_persistent", rotation_is_health: false };
+  const anchor = connectedMono ?? busStartedMono;
+  if (anchor != null && nowMono - anchor < LIMITS.connectGraceMs) {
+    return { action: "none", reason: "connect_grace", ...base };
   }
-  if (unrecoveredPing(busEvents, samples, nowMono)) {
-    return { action: "recycle_full", reason: "ping_timeout_unrecovered", rotation_is_health: false };
+  const mine = ownedSamples(samples, busPid, generation);
+  const stall = findSustainedStall(mine, busPid);
+  if (stall?.severe) {
+    return {
+      action: "recycle_full",
+      reason: "half_open_confirmed",
+      ...base,
+      evidence: `${formatSocketEvidence(stall.sock)} span_ms=${stall.spanMs} samples=${mine.length}`,
+    };
   }
-  return { action: "none", reason: "no_bounded_fault", rotation_is_health: false };
+  if (stall) {
+    return {
+      action: "recycle_full",
+      reason: "half_open_persistent",
+      ...base,
+      evidence: `${formatSocketEvidence(stall.sock)} span_ms=${stall.spanMs} samples=${mine.length}`,
+    };
+  }
+  if (unrecoveredPing(busEvents, mine, nowMono, busPid, generation, busStartedMono)) {
+    return { action: "recycle_full", reason: "ping_timeout_unrecovered", ...base };
+  }
+  return { action: "none", reason: "no_bounded_fault", ...base };
 }
 
-export function planConsumeExit({ samples = [], busEvents = [], nowMono = 0, busAlive = false } = {}) {
-  const recovery = decideRecovery({ samples, busEvents, nowMono });
+export function planConsumeExit({
+  samples = [],
+  busEvents = [],
+  nowMono = 0,
+  busAlive = false,
+  busPid = 0,
+  generation = null,
+  connectedMono = null,
+  busStartedMono = null,
+  recentRecycleMonos = [],
+} = {}) {
+  const recovery = decideRecovery({
+    samples,
+    busEvents,
+    nowMono,
+    busPid,
+    generation,
+    connectedMono,
+    busStartedMono,
+    recentRecycleMonos,
+  });
   if (!busAlive || recovery.action === "recycle_full") {
     return {
       action: "recycle_full",
@@ -241,17 +386,17 @@ export function transportFrom({ decision, samples = [], probeHangs = 0, hasBus =
   const latest = samples[samples.length - 1];
   if (!latest) return { state: "unknown", reason: hasBus ? "no_sample" : "bus_unseen" };
   const kinds = (latest.sockets || []).map(classifySocket);
-  if (kinds.includes("half_open_severe") || kinds.includes("half_open_mild")) {
+  if (kinds.includes("half_open_candidate") || kinds.includes("half_open_mild")) {
     return { state: "degraded", reason: "half_open_unconfirmed" };
   }
   if (kinds.includes("idle_or_healthy")) return { state: "connected", reason: "tcp_idle_or_healthy" };
   return { state: "unknown", reason: latest.sockets?.length ? "unclassified" : "no_socket" };
 }
 
-export function e2eFrom({ pending = 0, failCount = 0, provenSinceRecycle = false } = {}) {
-  if (pending > 0 && failCount > 0) return "failing";
-  if (pending > 0) return "pending";
-  if (provenSinceRecycle) return "proven";
+export function e2eFrom({ pending = 0, failCount = 0, wakeAcceptedSinceRecycle = false } = {}) {
+  if (pending > 0 && failCount > 0) return "wake_failing";
+  if (pending > 0) return "wake_pending";
+  if (wakeAcceptedSinceRecycle) return "wake_accepted";
   return "unproven";
 }
 
@@ -287,11 +432,17 @@ export function defaultBusLogPath(appId, env = process.env) {
 }
 
 export function createBusLogReader(filePath, io = fs) {
-  let offset = 0;
+  let offset = null;
   let remainder = "";
   return function readNew(observedMono) {
     if (!filePath || !io.existsSync(filePath)) return [];
     const size = io.statSync(filePath).size;
+    if (offset == null) {
+      // Historical lines are not fresh events. The first call only seeks to EOF.
+      offset = size;
+      remainder = "";
+      return [];
+    }
     if (size < offset) {
       offset = 0;
       remainder = "";
@@ -354,9 +505,13 @@ export function samplePidSockets(pid, { command = "ss", timeoutMs = 5000 } = {})
       finish({ error: String(error?.message || error), sockets: [] });
     });
     child.on("exit", () => {
-      const sockets = parseSsTcp(out).filter((sock) => !sock.pid || sock.pid === pid);
-      if (!out && err) finish({ error: err.slice(0, 200), sockets });
-      else finish({ sockets });
+      const parsed = parseSsTcp(out);
+      // Exact pid only. A missing pid is a leftover (often FIN-WAIT after the previous bus
+      // exited) or an unscoped socket on the shared fake-IP, not this generation's bus.
+      const sockets = parsed.filter((sock) => sock.pid === pid);
+      const ignored = parsed.length - sockets.length;
+      if (!out && err) finish({ error: err.slice(0, 200), sockets, ignored });
+      else finish({ sockets, ignored });
     });
   });
 }

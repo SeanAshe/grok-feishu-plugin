@@ -593,6 +593,7 @@ async function runMonitor() {
     nowMono: () => performance.now(),
     nowWall: () => Date.now(),
     readUptimeMs,
+    processAgeMs,
     writeHealth,
     writePid,
     clearPid,

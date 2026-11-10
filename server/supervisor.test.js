@@ -38,10 +38,10 @@ function harness(sampleSockets) {
     },
     graceMs: 0,
     probeTimeoutMs: 40,
-    spawnConsume: ({ onExit }) => {
+    spawnConsume: ({ onExit, onStderr }) => {
       const pid = ++seq;
       cmdline.set(pid, "lark-cli event consume im.message.receive_v1 --as bot");
-      const handle = { pid, onExit, closeStdin() {} };
+      const handle = { pid, onExit, onStderr, closeStdin() {} };
       spawns.push(handle);
       return handle;
     },
@@ -95,6 +95,7 @@ const severe = {
   bytesRetrans: 472,
   bytesAcked: 1655,
   bytesSent: 2185,
+  pid: BUS,
 };
 
 const healthy = {
@@ -106,16 +107,20 @@ const healthy = {
   backoff: 0,
   bytesAcked: 1338,
   bytesSent: 1337,
+  pid: BUS,
 };
 
 function killedPids(kills) {
   return kills.map((item) => item.pid);
 }
 
-test("half-open socket recycles consume and bus and does not signal the MCP host", async () => {
+test("sustained half-open of the current bus recycles it and does not signal the MCP host", async () => {
   const h = harness();
-  h.setSockets([severe]);
+  h.setSockets([{ ...severe, pid: BUS }]);
   await h.sup.start();
+  await h.sup.tick();
+  assert.equal(h.sup.snapshot().recycleCount, 0);
+  h.setMono(16_000);
   await h.sup.tick();
   const pids = killedPids(h.kills);
   assert.equal(pids.includes(MCP), false);
@@ -125,7 +130,60 @@ test("half-open socket recycles consume and bus and does not signal the MCP host
   assert.equal(h.sup.snapshot().recycleCount, 1);
   assert.equal(h.spawns.length, 2);
   assert.equal(h.sup.snapshot().e2e, "unproven");
+  assert.equal(h.sup.snapshot().reply_e2e, "unproven");
   assert.equal(h.sup.snapshot().rotation_is_health, false);
+});
+
+test("fresh connect, stale FIN-WAIT, and another fake-IP socket do not recycle", async () => {
+  const h = harness();
+  const corpse = {
+    state: "FIN-WAIT-1",
+    sendQ: 25,
+    rto: 52224,
+    backoff: 8,
+    bytesRetrans: 192,
+    bytesAcked: 1301,
+    bytesSent: 1516,
+    pid: null,
+    local: "172.30.0.2:32966",
+    peer: "198.18.0.1:443",
+  };
+  const otherProcess = { ...severe, pid: 9999, local: "172.30.0.2:111" };
+  const ownClose = { ...corpse, pid: BUS, local: "172.30.0.2:32967" };
+  h.setSockets([healthy, corpse, otherProcess, ownClose]);
+  await h.sup.start();
+  await h.sup.tick();
+  h.spawns.at(-1).onStderr("feishu-websocket: connected");
+  for (let i = 1; i <= 6; i += 1) {
+    h.setMono(i * 14_000);
+    h.setWall(h.wall() + 180_000);
+    await h.sup.tick();
+  }
+  assert.equal(h.sup.snapshot().recycleCount, 0);
+  assert.equal(h.kills.length, 0);
+  assert.equal(h.sup.snapshot().transport.state, "connected");
+  assert.equal(h.sup.snapshot().e2e, "unproven");
+});
+
+test("websocket connected 4s earlier does not confirm, a later frozen stall does", async () => {
+  const h = harness();
+  h.setSockets([severe]);
+  await h.sup.start();
+  await h.sup.tick();
+  h.setMono(2_000);
+  h.spawns.at(-1).onStderr("feishu-websocket: connected");
+  await h.sup.tick();
+  h.setMono(4_000);
+  await h.sup.tick();
+  assert.equal(h.sup.snapshot().recycleCount, 0);
+  h.setMono(20_000);
+  await h.sup.tick();
+  assert.equal(h.sup.snapshot().recycleCount, 1);
+  assert.equal(killedPids(h.kills).includes(BUS), true);
+  assert.equal(killedPids(h.kills).includes(MCP), false);
+  h.setMono(25_000);
+  await h.sup.tick();
+  assert.equal(h.sup.snapshot().recycleCount, 1);
 });
 
 test("failed sdk reconnect recycles and a real bus restart does not", async () => {
@@ -153,12 +211,13 @@ test("failed sdk reconnect recycles and a real bus restart does not", async () =
   assert.equal(healed.sup.snapshot().recycleCount, 0);
 });
 
-test("two hung probes recycle; one hang and a clock jump do not", async () => {
+test("two hung probes recycle after connect grace; one hang and a clock jump do not", async () => {
   const hung = harness(() => new Promise(() => {}));
   await hung.sup.start();
   await hung.sup.tick();
   assert.equal(hung.sup.snapshot().recycleCount, 0);
   assert.equal(hung.sup.snapshot().probeHangs, 1);
+  hung.setMono(16_000);
   await hung.sup.tick();
   assert.equal(hung.sup.snapshot().recycleCount, 1);
   assert.equal(killedPids(hung.kills).includes(MCP), false);
@@ -178,7 +237,7 @@ test("two hung probes recycle; one hang and a clock jump do not", async () => {
 
 test("healthy consumer exit reuses the bus; half-open exit recycles it; exit 0 is not immediate", async () => {
   const h = harness();
-  h.setSockets([healthy]);
+  h.setSockets([{ ...healthy, pid: BUS }]);
   await h.sup.start();
   await h.sup.tick();
   h.spawns.at(-1).onExit(0, null);
@@ -190,10 +249,10 @@ test("healthy consumer exit reuses the bus; half-open exit recycles it; exit 0 i
   assert.equal(h.sup.snapshot().e2e, "unproven");
   assert.equal(h.sup.snapshot().transport.state, "connected");
 
-  h.setSockets([severe]);
+  h.setSockets([{ ...severe, pid: BUS }]);
   h.spawns.at(-1).onExit(0, null);
   await h.sup.idle();
-  assert.equal(killedPids(h.kills).includes(BUS), true);
+  assert.equal(killedPids(h.kills).includes(BUS), false);
   assert.equal(killedPids(h.kills).includes(MCP), false);
 
   const rapid = harness();
@@ -283,6 +342,7 @@ test("clock suspect from the supervisor keeps a duplicate-safe wake retryable", 
   assert.equal(again.status, "duplicate_processed");
   assert.equal(calls, 1);
   h.sup.noteWakeOk();
-  assert.equal(h.sup.snapshot().e2e, "proven");
+  assert.equal(h.sup.snapshot().e2e, "wake_accepted");
+  assert.equal(h.sup.snapshot().reply_e2e, "unproven");
   assert.equal(h.sup.snapshot().transport.state, "connected");
 });
