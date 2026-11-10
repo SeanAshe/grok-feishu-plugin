@@ -69,6 +69,10 @@ test("fresh monitor is kept, stale monitor is replaced, startup grace is not a w
   assert.equal(stale.action, "replace_wedged");
   assert.deepEqual(stale.kill, [{ pid: 4, role: "monitor", sig: "SIGTERM" }]);
   assert.equal(heartbeatAgeMs({ pid: 9, uptime_ms: 10 }, 20, 4), null);
+  assert.equal(
+    heartbeatAgeMs({ pid: 4, boot_uptime_ms: 170_000_000, monitor_age_ms: 3_500_000, uptime_ms: 1 }, 170_010_000, 4),
+    10_000,
+  );
   const stat = "123 (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0";
   assert.equal(startTimeMsFromStat(stat, 100), 5_000);
 });
@@ -92,7 +96,23 @@ test("durability view never promotes a stale or transport-only state to e2e", ()
   assert.equal(live.process_ready, true);
   assert.equal(live.transport_state, "connected");
   assert.equal(live.e2e_state, "unproven");
+  assert.equal(live.reply_e2e, "unproven");
   assert.equal(live.rotation_is_health, false);
+  const woke = buildDurabilityView({
+    role: "monitor",
+    alive: true,
+    heartbeatAgeMs: 1_000,
+    health: {
+      transport: { state: "connected", reason: "tcp_idle_or_healthy" },
+      e2e: { state: "wake_accepted" },
+      boot_uptime_ms: 170_000_000,
+      monitor_age_ms: 12_785_000,
+    },
+  });
+  assert.equal(woke.e2e_state, "wake_accepted");
+  assert.equal(woke.reply_e2e, "unproven");
+  assert.equal(woke.monitor_age_ms, 12_785_000);
+  assert.equal(woke.boot_uptime_ms, 170_000_000);
 });
 
 test("connector absence uses uptime, so a wall-clock jump is not an input", () => {

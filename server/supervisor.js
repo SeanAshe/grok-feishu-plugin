@@ -1,10 +1,13 @@
 import {
+  classifySocket,
   decideRecovery,
   e2eFrom,
+  formatSocketEvidence,
   nextClockSample,
   planConsumeExit,
   restartDelayMs,
   runBounded,
+  selectCurrentSockets,
   transportFrom,
   LIMITS,
 } from "./transport.js";
@@ -28,7 +31,10 @@ export function createSupervisor(deps) {
   let clockSuspectUntil = 0;
   let heartbeatSeq = 0;
   let recycleCount = 0;
-  let provenSinceRecycle = false;
+  let wakeAcceptedSinceRecycle = false;
+  let connectedMono = null;
+  let busStartedMono = null;
+  let recentRecycleMonos = [];
   let exitStamps = [];
   let lastRestartDelayMs = 0;
   let lastFailCount = 0;
@@ -50,12 +56,25 @@ export function createSupervisor(deps) {
   }
 
   function noteWakeOk() {
-    provenSinceRecycle = true;
+    wakeAcceptedSinceRecycle = true;
+  }
+
+  function noteWsConnected(mono = deps.nowMono()) {
+    connectedMono = mono;
   }
 
   function snapshot() {
     const pending = deps.pendingCount?.() || 0;
-    const decision = decideRecovery({ samples, busEvents, nowMono: deps.nowMono() });
+    const decision = decideRecovery({
+      samples,
+      busEvents,
+      nowMono: deps.nowMono(),
+      busPid,
+      generation,
+      connectedMono,
+      busStartedMono,
+      recentRecycleMonos,
+    });
     const transport = transportFrom({
       decision: decision.action === "recycle_full" ? { action: "none" } : decision,
       samples,
@@ -63,7 +82,7 @@ export function createSupervisor(deps) {
       hasBus: Boolean(busPid),
       hasConsume: Boolean(consume?.pid),
     });
-    const e2e = e2eFrom({ pending, failCount: lastFailCount, provenSinceRecycle });
+    const e2e = e2eFrom({ pending, failCount: lastFailCount, wakeAcceptedSinceRecycle });
     return {
       stopped,
       consumePid: consume?.pid || 0,
@@ -77,15 +96,22 @@ export function createSupervisor(deps) {
       pending,
       lastRestartDelayMs,
       rotation_is_health: false,
-      provenSinceRecycle,
+      wakeAcceptedSinceRecycle,
+      reply_e2e: "unproven",
       heartbeatSeq,
     };
   }
 
-  function rememberBus(pid) {
+  function rememberBus(pid, mono) {
     if (!pid || pid === deps.selfPid) return;
+    if (deps.isAlive && deps.isAlive(pid) === false) return;
     const role = identifyProcess(pid, deps.readCmdline?.(pid) || "");
-    if (role === "bus") busPid = pid;
+    if (role !== "bus") return;
+    if (pid === busPid) return;
+    busPid = pid;
+    busStartedMono = mono ?? deps.nowMono();
+    connectedMono = null;
+    samples = samples.filter((sample) => sample.busPid === pid);
   }
 
   async function signalCurrent(sig, { onlyIfAlive = false } = {}) {
@@ -109,7 +135,7 @@ export function createSupervisor(deps) {
           .then(() => deps.onEventLine?.(line))
           .then((result) => {
             if (stopped || seenGen !== consume?.gen) return;
-            if (result?.wakeOk) provenSinceRecycle = true;
+            if (result?.wakeOk) wakeAcceptedSinceRecycle = true;
             if (result?.failCount) lastFailCount = result.failCount;
           })
           .catch((error) => log(`event error ${error instanceof Error ? error.message : String(error)}`));
@@ -117,20 +143,33 @@ export function createSupervisor(deps) {
       onExit: (code, signal) => {
         void noteExit(gen, code, signal);
       },
+      onStderr: (line) => {
+        if (gen !== generation) return;
+        if (/websocket:\s*connected/i.test(line)) noteWsConnected();
+      },
     });
     consume = { ...handle, gen };
     startedConsume = true;
     return consume;
   }
 
-  async function doRecycle(reason) {
+  async function doRecycle(decision) {
     if (stopped) return;
+    const reason = typeof decision === "string" ? decision : decision?.reason || "recycle";
+    const evidence = typeof decision === "string" ? "" : decision?.evidence || "";
     recycleCount += 1;
-    provenSinceRecycle = false;
+    wakeAcceptedSinceRecycle = false;
     samples = [];
     busEvents = [];
     probeHangs = 0;
-    log(`recycle_full ${reason} consume=${consume?.pid || 0} bus=${busPid || 0}`);
+    connectedMono = null;
+    busStartedMono = null;
+    const now = deps.nowMono();
+    recentRecycleMonos = recentRecycleMonos.filter((stamp) => now - stamp < LIMITS.recycleBudgetWindowMs);
+    recentRecycleMonos.push(now);
+    log(
+      `recycle_full reason=${reason} consume=${consume?.pid || 0} bus=${busPid || 0} generation=${generation} ${evidence}`.trim(),
+    );
     await signalCurrent("SIGTERM");
     if (consume?.closeStdin) {
       try {
@@ -143,7 +182,6 @@ export function createSupervisor(deps) {
     await signalCurrent("SIGKILL", { onlyIfAlive: true });
     consume = null;
     busPid = 0;
-    const now = deps.nowMono();
     exitStamps = exitStamps.filter((stamp) => now - stamp < 60_000);
     exitStamps.push(now);
     lastRestartDelayMs = restartDelayMs(countRecent(exitStamps, now));
@@ -172,10 +210,11 @@ export function createSupervisor(deps) {
       log(`lark-cli exited code=${code} signal=${signal}`);
       const now = deps.nowMono();
       exitStamps = exitStamps.filter((stamp) => now - stamp < 60_000);
-      if (busPid && deps.sampleSockets) {
+      if (busPid && deps.sampleSockets && deps.isAlive?.(busPid) !== false) {
         const probe = await runBounded(() => deps.sampleSockets(busPid), deps.probeTimeoutMs ?? 8000);
         if (!probe.hung && !probe.value?.error) {
-          samples.push({ monoMs: now, sockets: probe.value?.sockets || [] });
+          const scoped = selectCurrentSockets(probe.value?.sockets || [], busPid);
+          samples.push({ monoMs: now, busPid, generation, sockets: scoped.kept });
           if (samples.length > 8) samples.shift();
         }
       }
@@ -184,9 +223,14 @@ export function createSupervisor(deps) {
         busEvents,
         nowMono: now,
         busAlive: Boolean(busPid) && deps.isAlive?.(busPid) !== false,
+        busPid,
+        generation,
+        connectedMono,
+        busStartedMono,
+        recentRecycleMonos,
       });
       if (plan.action === "recycle_full") {
-        await doRecycle(plan.reason);
+        await doRecycle(plan);
         return;
       }
       exitStamps.push(now);
@@ -206,24 +250,32 @@ export function createSupervisor(deps) {
       clockState = nextClockSample(clockState, nowWall, nowMono);
       if (clockState.suspect) clockSuspectUntil = nowMono + LIMITS.clockSuspectHoldMs;
 
+      if (busPid && deps.isAlive && deps.isAlive(busPid) === false) {
+        busPid = 0;
+        samples = [];
+        busStartedMono = null;
+        connectedMono = null;
+      }
       if (consume?.pid && deps.readChildren && deps.readCmdline) {
         for (const child of descendantPids(consume.pid, deps.readChildren)) {
-          rememberBus(child);
+          rememberBus(child, nowMono);
         }
       }
       if (deps.readNewBusEvents) {
         const fresh = await deps.readNewBusEvents(nowMono);
         if (fresh?.length) {
-          busEvents.push(...fresh.map((event) => ({ ...event, monoMs: event.monoMs ?? nowMono })));
+          busEvents.push(
+            ...fresh.map((event) => ({ ...event, monoMs: event.monoMs ?? nowMono, generation })),
+          );
           if (busEvents.length > 80) busEvents = busEvents.slice(-80);
           for (const event of fresh) {
-            if (event.kind === "bus_started") rememberBus(event.pid);
+            if (event.kind === "bus_started") rememberBus(event.pid, event.monoMs ?? nowMono);
           }
         }
       }
 
       let probeHungThisTick = false;
-      if (busPid && deps.sampleSockets) {
+      if (busPid && deps.sampleSockets && deps.isAlive?.(busPid) !== false) {
         const probe = await runBounded(() => deps.sampleSockets(busPid), deps.probeTimeoutMs ?? 8000);
         if (probe.hung) {
           probeHangs += 1;
@@ -233,25 +285,64 @@ export function createSupervisor(deps) {
           log(`probe error ${probe.value.error}`);
         } else {
           probeHangs = 0;
-          const sockets = probe.value?.sockets || [];
-          samples.push({ monoMs: nowMono, sockets });
+          const raw = probe.value?.sockets || [];
+          const scoped = selectCurrentSockets(raw, busPid);
+          if (scoped.ignored.length || probe.value?.ignored) {
+            const counts = {};
+            for (const item of scoped.ignored) counts[item.reason] = (counts[item.reason] || 0) + 1;
+            const summary = Object.entries(counts)
+              .map(([key, count]) => `${key}:${count}`)
+              .join(",");
+            log(
+              `probe_scope bus=${busPid} generation=${generation} kept=${scoped.kept.length} ignored=${summary || `unscoped:${probe.value?.ignored || 0}`}`,
+            );
+          }
+          for (const sock of scoped.kept) {
+            const kind = classifySocket(sock);
+            if (kind === "half_open_candidate" || kind === "half_open_mild") {
+              log(`probe_candidate bus=${busPid} generation=${generation} ${formatSocketEvidence(sock)}`);
+            }
+          }
+          samples.push({ monoMs: nowMono, busPid, generation, sockets: scoped.kept });
           if (samples.length > 8) samples.shift();
         }
       }
 
-      let decision = decideRecovery({ samples, busEvents, nowMono });
-      if (probeHangs >= 2) decision = { action: "recycle_full", reason: "probe_hung", rotation_is_health: false };
+      const recoveryInput = {
+        samples,
+        busEvents,
+        nowMono,
+        busPid,
+        generation,
+        connectedMono,
+        busStartedMono,
+        recentRecycleMonos,
+      };
+      let decision = decideRecovery(recoveryInput);
+      if (
+        probeHangs >= 2 &&
+        decision.action === "none" &&
+        decision.reason !== "recycle_cooldown" &&
+        decision.reason !== "connect_grace"
+      ) {
+        decision = {
+          action: "recycle_full",
+          reason: "probe_hung",
+          evidence: `probe_hangs=${probeHangs}`,
+          rotation_is_health: false,
+        };
+      }
       if (!probeHungThisTick && decision.action === "none" && probeHangs === 1) {
-        // a single hung probe is not yet a recycle
+        log(`probe_hang bus=${busPid} generation=${generation} count=1`);
       }
 
       if (decision.action === "recycle_full") {
-        await doRecycle(decision.reason);
+        await doRecycle(decision);
       }
 
       if (deps.flushWakes) {
         const flushed = await deps.flushWakes();
-        if (flushed?.okCount > 0) provenSinceRecycle = true;
+        if (flushed?.okCount > 0) wakeAcceptedSinceRecycle = true;
         lastFailCount = flushed?.failCount || 0;
       }
 
@@ -259,12 +350,14 @@ export function createSupervisor(deps) {
       const view = snapshot();
       deps.writeHealth?.({
         pid: deps.selfPid || process.pid,
-        uptime_ms: deps.readUptimeMs?.() ?? nowMono,
+        boot_uptime_ms: deps.readUptimeMs?.() ?? null,
+        monitor_age_ms: deps.processAgeMs?.(deps.selfPid || process.pid, deps.readUptimeMs?.() ?? nowMono) ?? null,
         seq: heartbeatSeq,
         transport: view.transport,
         e2e: {
           state: view.e2e,
-          note: "transport_connected is not end-to-end delivery",
+          note: "wake_accepted is webhook HTTP only, not a Feishu reply",
+          reply_e2e: "unproven",
         },
         pending_wakes: view.pending,
         clock_suspect: view.clockSuspect,
@@ -291,7 +384,7 @@ export function createSupervisor(deps) {
     if (deps.flushWakes) {
       await schedule(async () => {
         const flushed = await deps.flushWakes();
-        if (flushed?.okCount > 0) provenSinceRecycle = true;
+        if (flushed?.okCount > 0) wakeAcceptedSinceRecycle = true;
         lastFailCount = flushed?.failCount || 0;
       });
     }

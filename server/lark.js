@@ -240,7 +240,7 @@ export function eventConsumeArgs() {
  * The child is a new process-group leader so stop/recycle can signal that
  * group without touching the MCP host.
  */
-export function spawnEventConsume({ onLine, onExit, log } = {}) {
+export function spawnEventConsume({ onLine, onExit, onStderr, log } = {}) {
   const bin = resolveLarkCli();
   const args = eventConsumeArgs();
   log?.(`spawn ${bin} ${args.join(" ")} (stdin held open, no consume timeout)`);
@@ -272,7 +272,9 @@ export function spawnEventConsume({ onLine, onExit, log } = {}) {
   child.stderr.on("data", (chunk) => {
     for (const line of chunk.split("\n")) {
       const t = line.trim();
-      if (t) log?.(`stderr ${t}`);
+      if (!t) continue;
+      log?.(`stderr ${t}`);
+      onStderr?.(t);
     }
   });
 
